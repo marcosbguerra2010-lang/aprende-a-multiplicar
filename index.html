@@ -142,6 +142,13 @@
             font-weight: 700;
             font-size: 0.85rem;
         }
+        .marcador-puntos {
+            text-align: center;
+            font-weight: 700;
+            font-size: 0.95rem;
+            color: #854d0e;
+            margin-bottom: 0.6rem;
+        }
         .pill-racha {
             background: #ffedd5;
             border: 2px solid #fb923c;
@@ -483,6 +490,7 @@
             color: #64748b;
         }
         .rank-valor {
+            white-space: nowrap;
             font-size: 1.15rem;
             font-weight: 700;
             color: #0284c7;
@@ -555,6 +563,8 @@
             <div class="progreso-barra" id="barraProgreso"></div>
         </div>
 
+        <div class="marcador-puntos" id="marcadorPuntos"></div>
+
         <div class="tarjeta-operacion">
             <div class="operacion" id="pregunta">2 × 9</div>
         </div>
@@ -584,7 +594,7 @@
         </div>
 
         <div class="tabs-ranking">
-            <button class="tab-btn activo" id="tabPuntos" onclick="cambiarTabRanking('puntos')">⭐ Mayor Puntaje</button>
+            <button class="tab-btn activo" id="tabPuntos" onclick="cambiarTabRanking('puntos')">⭐ Puntos Totales</button>
             <button class="tab-btn" id="tabRacha" onclick="cambiarTabRanking('racha')">🔥 Mejor Racha</button>
         </div>
 
@@ -656,6 +666,7 @@
 
     const elBadge = document.getElementById('badgeNivel');
     const elContador = document.getElementById('contadorProgreso');
+    const elMarcador = document.getElementById('marcadorPuntos');
     const elRacha = document.getElementById('contadorRacha');
     const elVidas = document.getElementById('indicadorVidas');
     const elBarra = document.getElementById('barraProgreso');
@@ -694,18 +705,34 @@
         return Number.isFinite(n) && n > 0 ? n : 0;
     }
 
-    // Devuelve un jugador limpio ({nombre, mejorPuntaje, mejorRacha, partidas})
-    // o null si el dato no se puede usar.
+    // Devuelve un jugador limpio o null si el dato no se puede usar.
+    // puntosTotales: puntos acumulados ya confirmados. Los registros anteriores a
+    // este campo arrancan con su mejor puntaje.
+    // pendientes: puntos ganados en este dispositivo que aún no están en la nube.
     function limpiarJugador(j) {
         if (!j || typeof j !== 'object') return null;
         const nombre = sanitizarNombre(j.nombre);
         if (!nombre) return null;
+        const mejorPuntaje = entero(j.mejorPuntaje);
         return {
             nombre: nombre,
-            mejorPuntaje: entero(j.mejorPuntaje),
+            mejorPuntaje: mejorPuntaje,
             mejorRacha: entero(j.mejorRacha),
-            partidas: entero(j.partidas)
+            partidas: entero(j.partidas),
+            puntosTotales: j.puntosTotales === undefined ? mejorPuntaje : entero(j.puntosTotales),
+            pendientes: entero(j.pendientes)
         };
+    }
+
+    // Igual que limpiarJugador, para datos de la nube (allí no existen "pendientes").
+    function datoDeNube(j) {
+        const limpio = limpiarJugador(j);
+        if (limpio) limpio.pendientes = 0;
+        return limpio;
+    }
+
+    function totalDe(j) {
+        return j.puntosTotales + j.pendientes;
     }
 
     function fusionarJugador(a, b) {
@@ -717,7 +744,9 @@
             nombre: x.nombre,
             mejorPuntaje: Math.max(x.mejorPuntaje, y.mejorPuntaje),
             mejorRacha: Math.max(x.mejorRacha, y.mejorRacha),
-            partidas: Math.max(x.partidas, y.partidas)
+            partidas: Math.max(x.partidas, y.partidas),
+            puntosTotales: Math.max(x.puntosTotales, y.puntosTotales),
+            pendientes: Math.max(x.pendientes, y.pendientes)
         };
     }
 
@@ -767,8 +796,12 @@
                 if (!res.ok) throw new Error('HTTP ' + res.status);
                 const dataNube = await res.json();
                 if (dataNube && typeof dataNube === 'object') {
-                    Object.values(dataNube).forEach(incorporar);
+                    Object.values(dataNube).forEach(j => incorporar(datoDeNube(j)));
                     guardarLocal();
+                    // Sube los puntos que quedaron sin enviar (p. ej. jugados sin conexión).
+                    Object.values(baseJugadores)
+                        .filter(j => j.pendientes > 0)
+                        .forEach(sincronizarJugador);
                 }
             } catch (e) {
                 console.warn("Modo offline activo:", e);
@@ -790,7 +823,7 @@
 
         const resLeer = await fetch(url);
         if (!resLeer.ok) throw new Error('lectura HTTP ' + resLeer.status);
-        const enNube = limpiarJugador(await resLeer.json());
+        const enNube = datoDeNube(await resLeer.json());
         if (enNube && claveDe(enNube.nombre) === clave) {
             incorporar(enNube);
             // Si la nube ya tiene un nombre para este jugador, se respeta (evita que
@@ -799,16 +832,34 @@
         }
         guardarLocal();
 
+        const jugador = baseJugadores[clave];
+        const enviados = jugador.pendientes;
+        const total = jugador.puntosTotales + enviados;
+
         const resEscribir = await fetch(url, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(baseJugadores[clave])
+            body: JSON.stringify({
+                nombre: jugador.nombre,
+                mejorPuntaje: jugador.mejorPuntaje,
+                mejorRacha: jugador.mejorRacha,
+                partidas: jugador.partidas,
+                puntosTotales: total
+            })
         });
         if (!resEscribir.ok) throw new Error('escritura HTTP ' + resEscribir.status);
+
+        // Solo al confirmar se descuentan los puntos enviados; los ganados mientras
+        // tanto siguen pendientes para la siguiente sincronización.
+        jugador.puntosTotales = Math.max(jugador.puntosTotales, total);
+        jugador.pendientes -= enviados;
+        guardarLocal();
+        actualizarMarcador();
     }
 
     // Las sincronizaciones se encolan para que dos respuestas seguidas no se pisen.
     let colaSync = Promise.resolve();
+    const enCola = new Set();
 
     function sincronizarJugador(datosJugador) {
         incorporar(datosJugador);
@@ -817,9 +868,13 @@
         const clave = claveDe(limpio.nombre);
         guardarLocal();
 
-        colaSync = colaSync
-            .then(() => subirJugador(clave))
-            .catch(e => console.warn("No se pudo sincronizar con la nube:", e));
+        // Si ya hay un envío de este jugador esperando turno, ese incluirá lo nuevo.
+        if (!enCola.has(clave)) {
+            enCola.add(clave);
+            colaSync = colaSync
+                .then(() => { enCola.delete(clave); return subirJugador(clave); })
+                .catch(e => console.warn("No se pudo sincronizar con la nube:", e));
+        }
         return colaSync;
     }
 
@@ -867,7 +922,9 @@
                 nombre: nombre,
                 mejorPuntaje: 0,
                 mejorRacha: 0,
-                partidas: 0
+                partidas: 0,
+                puntosTotales: 0,
+                pendientes: 0
             };
         }
         jugadorActual = baseJugadores[clave];
@@ -898,19 +955,20 @@
 
     function registrarProgresoEnRanking() {
         if (!jugadorActual) return;
-        let huboRecord = false;
 
         if (puntosPartida > jugadorActual.mejorPuntaje) {
             jugadorActual.mejorPuntaje = puntosPartida;
-            huboRecord = true;
         }
         if (rachaActual > jugadorActual.mejorRacha) {
             jugadorActual.mejorRacha = rachaActual;
-            huboRecord = true;
         }
-        if (huboRecord) {
-            sincronizarJugador(jugadorActual);
-        }
+        // Cada acierto suma puntos al total, así que siempre hay algo que guardar.
+        sincronizarJugador(jugadorActual);
+    }
+
+    function actualizarMarcador() {
+        if (!jugadorActual) return;
+        elMarcador.textContent = `🏆 Total: ${totalDe(jugadorActual)} pts · Esta partida: ${puntosPartida}`;
     }
 
     async function abrirRanking() {
@@ -935,9 +993,9 @@
         const lista = Object.values(baseJugadores);
 
         if (tabRankingActual === 'puntos') {
-            lista.sort((a, b) => b.mejorPuntaje - a.mejorPuntaje || b.mejorRacha - a.mejorRacha);
+            lista.sort((a, b) => totalDe(b) - totalDe(a) || b.mejorRacha - a.mejorRacha);
         } else {
-            lista.sort((a, b) => b.mejorRacha - a.mejorRacha || b.mejorPuntaje - a.mejorPuntaje);
+            lista.sort((a, b) => b.mejorRacha - a.mejorRacha || totalDe(b) - totalDe(a));
         }
 
         contenedor.textContent = '';
@@ -955,12 +1013,12 @@
             fila.className = `fila-ranking ${claseTop} ${esActual ? 'es-actual' : ''}`;
 
             const valorPrincipal = tabRankingActual === 'puntos'
-                ? `⭐ ${jug.mejorPuntaje} pts`
+                ? `⭐ ${totalDe(jug)} pts`
                 : `🔥 ${jug.mejorRacha} seguidos`;
 
             const subDetalle = tabRankingActual === 'puntos'
-                ? `Racha máx: 🔥 ${jug.mejorRacha}`
-                : `Puntaje máx: ⭐ ${jug.mejorPuntaje}`;
+                ? `Mejor: ${jug.mejorPuntaje} · 🔥 ${jug.mejorRacha}`
+                : `Puntos totales: ⭐ ${totalDe(jug)}`;
 
             // Se construye con textContent (nunca innerHTML) para que un nombre
             // malicioso guardado en la nube no pueda ejecutar código.
@@ -1109,9 +1167,10 @@
             const porcentaje = (aciertosEnNivel / cfg.meta) * 100;
             elBarra.style.width = `${porcentaje}%`;
         } else {
-            elContador.textContent = `⭐ ${puntosPartida} pts`;
+            elContador.textContent = `⭐ ∞`;
             elBarra.style.width = `100%`;
         }
+        actualizarMarcador();
     }
 
     function generarDistractores(n1, n2, correcta) {
@@ -1207,7 +1266,9 @@
             erroresSeguidos = 0;
 
             const puntosBase = nivelActual === 1 ? 10 : (nivelActual === 2 ? 15 : 20);
-            puntosPartida += puntosBase + Math.min(rachaActual, 10);
+            const ganados = puntosBase + Math.min(rachaActual, 10);
+            puntosPartida += ganados;
+            jugadorActual.pendientes += ganados;
 
             registrarProgresoEnRanking();
             mostrarVistaResultado(true, valorElegido);
