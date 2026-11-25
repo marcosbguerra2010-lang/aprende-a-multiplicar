@@ -667,23 +667,107 @@
     const elMensaje = document.getElementById('mensaje');
     const botones = document.querySelectorAll('.btn-opcion');
 
-    async function cargarBaseJugadores() {
-        const guardadoLocal = localStorage.getItem(STORAGE_KEY);
-        if (guardadoLocal) {
-            baseJugadores = JSON.parse(guardadoLocal);
+    // =========================================================================
+    // SEGURIDAD Y FUSIÓN DE DATOS
+    // - sanitizarNombre: quita caracteres que Firebase no admite en claves
+    //   (. # $ [ ] /) y los que sirven para inyectar HTML (< >).
+    // - fusionarJugador: conserva siempre el MAYOR valor de cada campo, de modo
+    //   que un dato desfasado (offline / otro dispositivo) nunca pisa un récord.
+    // =========================================================================
+    const MAX_NOMBRE = 20;
+
+    function sanitizarNombre(texto) {
+        return String(texto == null ? '' : texto)
+            .replace(/[.#$\[\]\/<>\\\u0000-\u001f\u007f]/g, '')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, MAX_NOMBRE)
+            .trim();
+    }
+
+    function claveDe(nombre) {
+        return nombre.toLowerCase();
+    }
+
+    function entero(v) {
+        const n = Math.floor(Number(v));
+        return Number.isFinite(n) && n > 0 ? n : 0;
+    }
+
+    // Devuelve un jugador limpio ({nombre, mejorPuntaje, mejorRacha, partidas})
+    // o null si el dato no se puede usar.
+    function limpiarJugador(j) {
+        if (!j || typeof j !== 'object') return null;
+        const nombre = sanitizarNombre(j.nombre);
+        if (!nombre) return null;
+        return {
+            nombre: nombre,
+            mejorPuntaje: entero(j.mejorPuntaje),
+            mejorRacha: entero(j.mejorRacha),
+            partidas: entero(j.partidas)
+        };
+    }
+
+    function fusionarJugador(a, b) {
+        const x = limpiarJugador(a);
+        const y = limpiarJugador(b);
+        if (!x) return y;
+        if (!y) return x;
+        return {
+            nombre: x.nombre,
+            mejorPuntaje: Math.max(x.mejorPuntaje, y.mejorPuntaje),
+            mejorRacha: Math.max(x.mejorRacha, y.mejorRacha),
+            partidas: Math.max(x.partidas, y.partidas)
+        };
+    }
+
+    // Mete un jugador en baseJugadores fusionando con el existente.
+    // Modifica el objeto existente en sitio para no perder la referencia de jugadorActual.
+    function incorporar(j) {
+        const limpio = limpiarJugador(j);
+        if (!limpio) return;
+        const clave = claveDe(limpio.nombre);
+        const actual = baseJugadores[clave];
+        if (actual) {
+            Object.assign(actual, fusionarJugador(actual, limpio));
         } else {
-            JUGADORES_INICIALES.forEach(j => {
-                baseJugadores[j.nombre.toLowerCase()] = j;
-            });
-            guardarLocal();
+            baseJugadores[clave] = limpio;
         }
+    }
+
+    function leerLocal() {
+        try {
+            const guardado = localStorage.getItem(STORAGE_KEY);
+            return guardado ? JSON.parse(guardado) : null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function guardarLocal() {
+        try {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(baseJugadores));
+        } catch (e) {
+            console.warn("No se pudo guardar en el dispositivo:", e);
+        }
+    }
+
+    async function cargarBaseJugadores() {
+        const local = leerLocal();
+        if (local && typeof local === 'object') {
+            Object.values(local).forEach(incorporar);
+        } else {
+            JUGADORES_INICIALES.forEach(incorporar);
+        }
+        guardarLocal();
 
         if (FIREBASE_DB_URL) {
             try {
                 const res = await fetch(FIREBASE_DB_URL);
+                if (!res.ok) throw new Error('HTTP ' + res.status);
                 const dataNube = await res.json();
                 if (dataNube && typeof dataNube === 'object') {
-                    baseJugadores = { ...baseJugadores, ...dataNube };
+                    Object.values(dataNube).forEach(incorporar);
                     guardarLocal();
                 }
             } catch (e) {
@@ -693,28 +777,46 @@
         renderizarChipsJugadores();
     }
 
-    function guardarLocal() {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(baseJugadores));
+    function urlJugador(clave) {
+        return FIREBASE_DB_URL.replace('.json', `/${encodeURIComponent(clave)}.json`);
     }
 
-    async function sincronizarJugador(datosJugador) {
-        const clave = datosJugador.nombre.toLowerCase();
-        baseJugadores[clave] = datosJugador;
+    // Lee el registro de la nube, lo fusiona con el local (máximo de cada campo)
+    // y solo entonces lo escribe. Si no se puede leer, NO escribe (así un dato
+    // desfasado jamás sobrescribe un récord).
+    async function subirJugador(clave) {
+        if (!FIREBASE_DB_URL || !baseJugadores[clave]) return;
+        const url = urlJugador(clave);
+
+        const resLeer = await fetch(url);
+        if (!resLeer.ok) throw new Error('lectura HTTP ' + resLeer.status);
+        incorporar(await resLeer.json());
         guardarLocal();
 
-        if (FIREBASE_DB_URL) {
-            try {
-                const urlJugador = FIREBASE_DB_URL.replace('.json', `/${encodeURIComponent(clave)}.json`);
-                await fetch(urlJugador, {
-                    method: 'PUT',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(datosJugador)
-                });
-            } catch (e) {
-                console.warn("No se pudo sincronizar con la nube:", e);
-            }
-        }
+        const resEscribir = await fetch(url, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(baseJugadores[clave])
+        });
+        if (!resEscribir.ok) throw new Error('escritura HTTP ' + resEscribir.status);
     }
+
+    // Las sincronizaciones se encolan para que dos respuestas seguidas no se pisen.
+    let colaSync = Promise.resolve();
+
+    function sincronizarJugador(datosJugador) {
+        incorporar(datosJugador);
+        const limpio = limpiarJugador(datosJugador);
+        if (!limpio) return colaSync;
+        const clave = claveDe(limpio.nombre);
+        guardarLocal();
+
+        colaSync = colaSync
+            .then(() => subirJugador(clave))
+            .catch(e => console.warn("No se pudo sincronizar con la nube:", e));
+        return colaSync;
+    }
+
 
     function renderizarChipsJugadores() {
         const lista = Object.values(baseJugadores);
@@ -735,13 +837,14 @@
     }
 
     function iniciarConNombre() {
-        const nombreLimpio = elInputNombre.value.trim();
+        const nombreLimpio = sanitizarNombre(elInputNombre.value);
         if (!nombreLimpio) {
             elInputNombre.focus();
             elInputNombre.style.borderColor = '#ef4444';
             return;
         }
         elInputNombre.style.borderColor = '#7dd3fc';
+        elInputNombre.value = nombreLimpio;
         seleccionarPerfil(nombreLimpio);
     }
 
@@ -750,7 +853,9 @@
     });
 
     function seleccionarPerfil(nombre) {
-        const clave = nombre.toLowerCase();
+        nombre = sanitizarNombre(nombre);
+        if (!nombre) return;
+        const clave = claveDe(nombre);
         if (!baseJugadores[clave]) {
             baseJugadores[clave] = {
                 nombre: nombre,
@@ -829,7 +934,7 @@
             lista.sort((a, b) => b.mejorRacha - a.mejorRacha || b.mejorPuntaje - a.mejorPuntaje);
         }
 
-        contenedor.innerHTML = '';
+        contenedor.textContent = '';
 
         lista.forEach((jug, index) => {
             const fila = document.createElement('div');
@@ -845,25 +950,44 @@
 
             const valorPrincipal = tabRankingActual === 'puntos'
                 ? `⭐ ${jug.mejorPuntaje} pts`
-                : `🔥 ${jug.mejorRacha} seg.`;
+                : `🔥 ${jug.mejorRacha} seguidos`;
 
             const subDetalle = tabRankingActual === 'puntos'
                 ? `Racha máx: 🔥 ${jug.mejorRacha}`
                 : `Puntaje máx: ⭐ ${jug.mejorPuntaje}`;
 
-            fila.innerHTML = `
-                <div class="rank-izq">
-                    <span class="medalla">${iconoPos}</span>
-                    <div>
-                        <div class="rank-nombre">${jug.nombre} ${esActual ? '(Tú)' : ''}</div>
-                        <div class="rank-sub">${subDetalle}</div>
-                    </div>
-                </div>
-                <div class="rank-valor">${valorPrincipal}</div>
-            `;
+            // Se construye con textContent (nunca innerHTML) para que un nombre
+            // malicioso guardado en la nube no pueda ejecutar código.
+            const izq = document.createElement('div');
+            izq.className = 'rank-izq';
+
+            const medalla = document.createElement('span');
+            medalla.className = 'medalla';
+            medalla.textContent = iconoPos;
+
+            const info = document.createElement('div');
+            const nombre = document.createElement('div');
+            nombre.className = 'rank-nombre';
+            nombre.textContent = esActual ? `${jug.nombre} (Tú)` : jug.nombre;
+            const sub = document.createElement('div');
+            sub.className = 'rank-sub';
+            sub.textContent = subDetalle;
+            info.appendChild(nombre);
+            info.appendChild(sub);
+
+            izq.appendChild(medalla);
+            izq.appendChild(info);
+
+            const valor = document.createElement('div');
+            valor.className = 'rank-valor';
+            valor.textContent = valorPrincipal;
+
+            fila.appendChild(izq);
+            fila.appendChild(valor);
             contenedor.appendChild(fila);
         });
     }
+
 
     const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     function sonido(tipo) {
