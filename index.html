@@ -790,7 +790,13 @@
 
         const resLeer = await fetch(url);
         if (!resLeer.ok) throw new Error('lectura HTTP ' + resLeer.status);
-        incorporar(await resLeer.json());
+        const enNube = limpiarJugador(await resLeer.json());
+        if (enNube && claveDe(enNube.nombre) === clave) {
+            incorporar(enNube);
+            // Si la nube ya tiene un nombre para este jugador, se respeta (evita que
+            // "ALAN" reescriba "Alan" para todos).
+            baseJugadores[clave].nombre = enNube.nombre;
+        }
         guardarLocal();
 
         const resEscribir = await fetch(url, {
