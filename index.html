@@ -147,6 +147,12 @@
             font-weight: 700;
             font-size: 0.95rem;
             color: #854d0e;
+            margin-bottom: 0.15rem;
+        }
+        .estado-nube {
+            text-align: center;
+            font-size: 0.8rem;
+            color: #64748b;
             margin-bottom: 0.6rem;
         }
         .pill-racha {
@@ -564,6 +570,7 @@
         </div>
 
         <div class="marcador-puntos" id="marcadorPuntos"></div>
+        <div class="estado-nube" id="estadoNube"></div>
 
         <div class="tarjeta-operacion">
             <div class="operacion" id="pregunta">2 × 9</div>
@@ -667,6 +674,7 @@
     const elBadge = document.getElementById('badgeNivel');
     const elContador = document.getElementById('contadorProgreso');
     const elMarcador = document.getElementById('marcadorPuntos');
+    const elEstadoNube = document.getElementById('estadoNube');
     const elRacha = document.getElementById('contadorRacha');
     const elVidas = document.getElementById('indicadorVidas');
     const elBarra = document.getElementById('barraProgreso');
@@ -781,6 +789,23 @@
         }
     }
 
+    const LIMITE_RED_MS = 15000;
+    const REINTENTO_MS = 10000;
+
+    // fetch con tiempo límite: una petición colgada no puede bloquear los guardados
+    // siguientes. El límite cubre también la lectura de la respuesta.
+    async function pedirNube(url, opciones = {}) {
+        const control = new AbortController();
+        const reloj = setTimeout(() => control.abort(), LIMITE_RED_MS);
+        try {
+            const res = await fetch(url, { ...opciones, cache: 'no-store', signal: control.signal });
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            return await res.json();
+        } finally {
+            clearTimeout(reloj);
+        }
+    }
+
     async function cargarBaseJugadores() {
         const local = leerLocal();
         if (local && typeof local === 'object') {
@@ -792,9 +817,7 @@
 
         if (FIREBASE_DB_URL) {
             try {
-                const res = await fetch(FIREBASE_DB_URL);
-                if (!res.ok) throw new Error('HTTP ' + res.status);
-                const dataNube = await res.json();
+                const dataNube = await pedirNube(FIREBASE_DB_URL);
                 if (dataNube && typeof dataNube === 'object') {
                     Object.values(dataNube).forEach(j => incorporar(datoDeNube(j)));
                     guardarLocal();
@@ -821,9 +844,7 @@
         if (!FIREBASE_DB_URL || !baseJugadores[clave]) return;
         const url = urlJugador(clave);
 
-        const resLeer = await fetch(url);
-        if (!resLeer.ok) throw new Error('lectura HTTP ' + resLeer.status);
-        const enNube = datoDeNube(await resLeer.json());
+        const enNube = datoDeNube(await pedirNube(url));
         if (enNube && claveDe(enNube.nombre) === clave) {
             incorporar(enNube);
             // Si la nube ya tiene un nombre para este jugador, se respeta (evita que
@@ -836,7 +857,7 @@
         const enviados = jugador.pendientes;
         const total = jugador.puntosTotales + enviados;
 
-        const resEscribir = await fetch(url, {
+        await pedirNube(url, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -847,19 +868,31 @@
                 puntosTotales: total
             })
         });
-        if (!resEscribir.ok) throw new Error('escritura HTTP ' + resEscribir.status);
 
         // Solo al confirmar se descuentan los puntos enviados; los ganados mientras
         // tanto siguen pendientes para la siguiente sincronización.
         jugador.puntosTotales = Math.max(jugador.puntosTotales, total);
         jugador.pendientes -= enviados;
         guardarLocal();
+        delete erroresSync[clave];
         actualizarMarcador();
     }
 
     // Las sincronizaciones se encolan para que dos respuestas seguidas no se pisen.
     let colaSync = Promise.resolve();
     const enCola = new Set();
+    const erroresSync = {};
+
+    // Vuelve a intentar todo lo que quedó sin guardar (puntos pendientes o envíos fallidos).
+    function reintentarPendientes() {
+        Object.values(baseJugadores)
+            .filter(j => j.pendientes > 0 || erroresSync[claveDe(j.nombre)])
+            .forEach(sincronizarJugador);
+    }
+
+    setInterval(reintentarPendientes, REINTENTO_MS);
+    window.addEventListener('online', reintentarPendientes);
+    document.addEventListener('visibilitychange', reintentarPendientes);
 
     function sincronizarJugador(datosJugador) {
         incorporar(datosJugador);
@@ -873,7 +906,11 @@
             enCola.add(clave);
             colaSync = colaSync
                 .then(() => { enCola.delete(clave); return subirJugador(clave); })
-                .catch(e => console.warn("No se pudo sincronizar con la nube:", e));
+                .catch(e => {
+                    erroresSync[clave] = e.name === 'AbortError' ? 'sin respuesta' : e.message;
+                    console.warn("No se pudo sincronizar con la nube:", e);
+                    actualizarMarcador();
+                });
         }
         return colaSync;
     }
@@ -969,6 +1006,16 @@
     function actualizarMarcador() {
         if (!jugadorActual) return;
         elMarcador.textContent = `🏆 Total: ${totalDe(jugadorActual)} pts · Esta partida: ${puntosPartida}`;
+
+        // Estado del guardado, visible para saber si los puntos llegaron a la nube.
+        const error = erroresSync[claveDe(jugadorActual.nombre)];
+        if (error) {
+            elEstadoNube.textContent = `⚠️ Sin guardar en la nube (${error}). Reintentando…`;
+        } else if (jugadorActual.pendientes > 0) {
+            elEstadoNube.textContent = '⏳ Guardando…';
+        } else {
+            elEstadoNube.textContent = '☁️ Guardado en la nube';
+        }
     }
 
     async function abrirRanking() {
